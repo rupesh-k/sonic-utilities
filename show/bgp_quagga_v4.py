@@ -1,12 +1,6 @@
 import click
-<<<<<<< ours
-from show.main import *
-=======
 from show.main import get_bgp_summary_extended, ip, multi_instance_bgp_summary, run_command
 from show.multi_npu import  multi_npu_platform, multi_npu_options
-
->>>>>>> theirs
-
 
 ###############################################################################
 #

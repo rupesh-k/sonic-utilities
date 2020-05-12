@@ -524,7 +524,7 @@ def multi_instance_bgp_summary(namespace, display_opt, af):
         else:
             vtysh_cmd = "show bgp ipv6 summary"
 
-        instance_output = json.loads(run_command('sudo docker exec -it  bgp{} -c "{} json"'.format(bgp_instance, vtysh_cmd), return_cmd=True))
+        instance_output = json.loads(run_command('sudo docker exec -it  bgp{} vtysh -c "{} json"'.format(bgp_instance, vtysh_cmd), return_cmd=True))
         multi_instance_bgp_summary_process(output, instance_output, ns, display_opt, af)
     multi_npu_display_bgp_summary(output,af)
 
