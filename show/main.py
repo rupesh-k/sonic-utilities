@@ -9,7 +9,8 @@ import re
 import subprocess
 import sys
 import ipaddress
-
+from pkg_resources import parse_version
+import swsssdk
 import click
 from click_default_group import DefaultGroup
 from natsort import natsorted
@@ -18,9 +19,11 @@ from tabulate import tabulate
 import sonic_device_util
 from swsssdk import ConfigDBConnector
 from swsssdk import SonicV2Connector
-
 import mlnx
+from multi_npu import multi_npu_process_options, multi_npu_platform, multi_npu_options
 
+from multi_npu import DISPLAY_ALL as DISPLAY_ALL
+from multi_npu import DISPLAY_EXTERNAL as DISPLAY_EXTERNAL
 SONIC_CFGGEN_PATH = '/usr/local/bin/sonic-cfggen'
 
 VLAN_SUB_INTERFACE_SEPARATOR = '.'
@@ -169,7 +172,12 @@ class AliasedGroup(DefaultGroup):
 # bash oneliner. To be revisited once routing-stack info is tracked somewhere.
 def get_routing_stack():
     command = "sudo docker ps | grep bgp | awk '{print$2}' | cut -d'-' -f3 | cut -d':' -f1"
-
+    """
+    In multi NPU platforms there are multi BGP containers running. 
+    So check the routing stack of the first one
+    """
+    if multi_npu_platform():
+        command += "| head -n 1"
     try:
         proc = subprocess.Popen(command,
                                 stdout=subprocess.PIPE,
@@ -396,6 +404,130 @@ def run_command_in_alias_mode(command):
     if rc != 0:
         sys.exit(rc)
 
+def multi_instance_bgp_summary_process(output, instance_data,  ns, display, af):
+    """This method process the "show ip bgp summary" json output 
+    and return
+
+    Args:
+        output ([dict]): The output to display [description]
+        instance_data (dict]): The data from "show ip bgp summary json" 
+        ns ([string]): Namespace
+        display (str): 
+            if equal to DISPLAY_ALL_INTFS, all bgp neighbor will be displayed
+            if equal to DISPLAY_EXTERNAL_INTFS, only external bgp neigh will be displayed
+        
+    """
+
+    static_neighbors, dynamic_neighbors = get_bgp_neighbors_dict(ns)
+
+    if af is 'v4' and instance_data.has_key('ipv4Unicast'):
+        bgp_summary =  instance_data['ipv4Unicast']
+    elif af is 'v6' and instance_data.has_key('ipv6Unicast'):
+        bgp_summary = instance_data['ipv6Unicast']
+    else:
+        return
+
+    if not output.has_key('peerCount'):
+        output['peerCount'] = bgp_summary['peerCount']
+    else:
+        output['peerCount']+= bgp_summary['peerCount']
+    if not output.has_key('peerMemory'):
+        output['peerMemory'] = bgp_summary['peerMemory']
+    else:
+        output['peerMemory']+= bgp_summary['peerMemory']
+    if not output.has_key('ribCount'):
+        output['ribCount'] = bgp_summary['ribCount']
+    else:
+        output['ribCount'] += bgp_summary['ribCount']
+    if not output.has_key('ribMemory'):
+        output['ribMemory'] = bgp_summary['ribMemory']
+    else:
+        output['ribMemory'] += bgp_summary['ribMemory']
+    if not output.has_key('router_info'):
+        output['router_info'] = []
+
+    router_info = {}
+    router_info['router_id'] = bgp_summary['routerId']
+    router_info['vrf'] = bgp_summary['vrfId']
+    router_info['as'] = bgp_summary['as']
+    router_info['tbl_ver'] = bgp_summary['tableVersion']
+    output['router_info'].append({ns: router_info})
+    
+    #ipv4UnicastData['peers'] = []
+
+    device_peers = bgp_summary['peers']
+    if not output.has_key('peers'):
+        output['peers'] = []
+
+    for peer_ip, value in device_peers.iteritems():
+        peers = []
+        if display == DISPLAY_EXTERNAL:
+            if value['remoteAs'] == bgp_summary['as']:
+                continue
+        peers.append(peer_ip)
+        neigh_name = get_bgp_neighbor_ip_to_name(peer_ip, static_neighbors, dynamic_neighbors)
+        peers.append( value['version'])
+        peers.append(value['remoteAs'])
+        peers.append(value['msgRcvd'])
+        peers.append(value['msgSent'])
+        peers.append(value['tableVersion'])
+
+        peers.append(value['inq'])
+        peers.append(value['outq'])
+        peers.append(value['peerUptime'])
+        if value['state'] == 'Established':
+            peers.append(value['pfxRcd'])
+        else:
+            peers.append(value['state'])
+
+        peers.append(neigh_name)
+        output['peers'].append(peers)
+        
+
+
+def multi_npu_display_bgp_summary(output,af):
+    headers = ["Neighbhor", "V", "AS", "MsgRcvd", "MsgSent", "TblVer", "InQ", "OutQ", "Up/Down", "State/PfxRcd", "NeighborName"]
+    click.echo("IP{} Unicast Summary:".format(af))
+    for router_info in output['router_info']:
+        for k in router_info.keys():
+            v = router_info[k]
+            click.echo("{}: BGP router identifier {}, local AS number {} vrf-id {}"\
+                        .format(k, v['router_id'], v['as'], v['vrf'] ))
+            click.echo("BGP table version {} ".format(v['tbl_ver']))
+    click.echo("RIB entries {}, using {} bytes of memory".format(output['ribCount'], output['ribMemory']))
+    click.echo("Peers {}, using {} KiB of memory".format(output['peerCount'], output['peerMemory']) )
+    print(tabulate(natsorted(output['peers']), headers = headers))  
+
+def multi_instance_bgp_summary(namespace, display_opt, af):
+    """
+    This function display the bgp summary from multi BGP containers running on 
+    multi NPU platforms
+
+    Arguments:
+        namespace [string -- Namespace 
+        display_opt string -- if 'all' display internal and external bgp neighbor summary
+                                    otherwise, display only external bgp summay 
+        af [string] -- 'v4' or 'v6'
+    """
+    output = dict()
+
+
+    for ns in multi_npu_process_options(display_opt, namespace):
+        """
+        Talk to the individual bgp instance by pass the instance id as argument to the vtysh script
+        The instance id is retrived from the namespace name
+        Example instance id is 1 for namespace "asic1"
+        """
+        bgp_instance = ns[-1] if ns is not None else ""
+        if af is 'v4':
+            vtysh_cmd = "show ip bgp summary"
+        else:
+            vtysh_cmd = "show bgp ipv6 summary"
+
+        instance_output = json.loads(run_command('sudo docker exec -it  bgp{} -c "{} json"'.format(bgp_instance, vtysh_cmd), return_cmd=True))
+        multi_instance_bgp_summary_process(output, instance_output, ns, display_opt, af)
+    multi_npu_display_bgp_summary(output,af)
+
 
 def get_bgp_summary_extended(command_output):
     """
@@ -444,8 +576,7 @@ def get_neighbor_dict_from_table(db,table_name):
     neighbor_data = db.get_table(table_name)
     try:
         for entry in neighbor_data.keys():
-            neighbor_dict[entry] = neighbor_data[entry].get(
-                'name') if 'name' in neighbor_data[entry].keys() else 'NotAvailable'
+            neighbor_dict[entry] = neighbor_data[entry].get('name') if 'name' in neighbor_data[entry].keys() else 'NotAvailable'
         return neighbor_dict
     except:
         return neighbor_dict
@@ -501,17 +632,20 @@ def get_dynamic_neighbor_subnet(db):
         return neighbor_data
 
 
-def get_bgp_neighbors_dict():
+def get_bgp_neighbors_dict(ns=''):
     """
     Uses config_db to get the bgp neighbors and names in dictionary format
     :return:
     """
+    swsssdk.SonicDBConfig.load_sonic_global_db_config(namespace=ns)
     dynamic_neighbors = {}
-    config_db = connect_config_db()
+    config_db = ConfigDBConnector(use_unix_socket_path=True, namespace=ns)
+    config_db.connect()
     static_neighbors = get_neighbor_dict_from_table(config_db, 'BGP_NEIGHBOR')
-    bgp_monitors = get_neighbor_dict_from_table(config_db, 'BGP_MONITORS')
+    bgp_monitors = get_neighbor_dict_from_table(config_db, 'BGP_MONITORS')    
     static_neighbors.update(bgp_monitors)
     dynamic_neighbors = get_dynamic_neighbor_subnet(config_db)
+    swsssdk.SonicDBConfig._sonic_db_global_config_init = False
     return static_neighbors, dynamic_neighbors
 
 
@@ -919,27 +1053,33 @@ def presence(interfacename, verbose):
 @interfaces.command()
 @click.argument('interfacename', required=False)
 @click.option('--verbose', is_flag=True, help="Enable verbose output")
-def description(interfacename, verbose):
+@multi_npu_options
+def description(interfacename, verbose, namespace, display):
     """Show interface status, protocol and description"""
 
-    cmd = "intfutil description"
+    cmd = "sudo intfutil -c description"
 
     if interfacename is not None:
         if get_interface_mode() == "alias":
             interfacename = iface_alias_converter.alias_to_name(interfacename)
 
-        cmd += " {}".format(interfacename)
-
+        cmd += "  -i {}".format(interfacename)
+    
+    if namespace is not None:
+        cmd += " -n {}".format(namespace)
+    if display  == DISPLAY_EXTERNAL:
+        cmd += " -d {}".format( display)
     run_command(cmd, display_cmd=verbose)
 
 
 @interfaces.command()
 @click.argument('interfacename', required=False)
 @click.option('--verbose', is_flag=True, help="Enable verbose output")
-def status(interfacename, verbose):
+@multi_npu_options
+def status(interfacename, verbose, namespace, display):
     """Show Interface status information"""
 
-    cmd = "intfutil status"
+    cmd = "sudo intfutil -c status"
 
     if interfacename is not None:
         if get_interface_mode() == "alias":
@@ -947,6 +1087,11 @@ def status(interfacename, verbose):
 
         cmd += " {}".format(interfacename)
 
+    if namespace is not None:
+        cmd += " -n {}".format(namespace)
+
+    if display  == DISPLAY_EXTERNAL:
+        cmd += " -d {}".format(display)
     run_command(cmd, display_cmd=verbose)
 
 
@@ -988,9 +1133,17 @@ def rif(interface, period, verbose):
 # 'portchannel' subcommand ("show interfaces portchannel")
 @interfaces.command()
 @click.option('--verbose', is_flag=True, help="Enable verbose output")
-def portchannel(verbose):
+@multi_npu_options
+def portchannel(verbose, namespace, display):
     """Show PortChannel information"""
     cmd = "sudo teamshow"
+    if namespace is not None:
+        cmd += " -n {}".format(namespace)
+
+    if display  == DISPLAY_EXTERNAL:
+        cmd += " -d {}".format(display)
+
+    
     run_command(cmd, display_cmd=verbose)
 
 #

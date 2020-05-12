@@ -1,5 +1,11 @@
 import click
+<<<<<<< ours
 from show.main import *
+=======
+from show.main import get_bgp_summary_extended, ip, multi_instance_bgp_summary, run_command
+from show.multi_npu import  multi_npu_platform, multi_npu_options
+
+>>>>>>> theirs
 
 
 ###############################################################################
@@ -17,8 +23,12 @@ def bgp():
 
 # 'summary' subcommand ("show ip bgp summary")
 @bgp.command()
-def summary():
+@multi_npu_options
+def summary(namespace, display):
     """Show summarized information of IPv4 BGP state"""
+    if multi_npu_platform():
+        multi_instance_bgp_summary(namespace, display, 'v4')
+        return
     try:
         device_output = run_command('sudo vtysh -c "show ip bgp summary"', return_cmd=True)
         get_bgp_summary_extended(device_output)
